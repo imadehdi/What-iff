@@ -1,0 +1,225 @@
+import time
+import numpy as np
+import casadi as ca
+
+class UniversalParametricWhatIf:
+    """
+    Moteur d'homotopie quadratique exact (Active-Set Continuation).
+    Gère n'importe quelle contrainte linéaire G*w <= b dans les deux sens (relâchement / resserrement),
+    y compris l'allumage et l'extinction de la contrainte manipulée elle-même.
+    """
+    def __init__(self, Sigma, mu_vec, A_eq, b_eq, G, b, constraint_names):
+        self.H = Sigma
+        self.c = -mu_vec  # min 0.5 * w^T H w + c^T w
+        self.A_eq = A_eq  # Contraintes d'égalité (ex: Budget)
+        self.b_eq = b_eq
+        self.G = G        # Toutes les inégalités linéaires G w <= b (secteurs, bornes max, -bornes min)
+        self.b = b.copy()
+        self.names = constraint_names
+        self.n = Sigma.shape[0]
+        self.m_eq = A_eq.shape[0]
+
+    def initialize_from_anchor(self, w_star, mu_eq_star, mu_ineq_star, tol=1e-7):
+        """Construit la base active initiale et inverse la matrice KKT une seule fois."""
+        self.w_star = w_star.copy()
+        self.mu_eq_star = mu_eq_star.copy()
+        self.mu_ineq_star = mu_ineq_star.copy()
+        
+        # Une inégalité i est active si elle touche sa borne ET son multiplicateur est > 0
+        slack = self.b - self.G @ w_star
+        self.active_ineq = [
+            i for i in range(len(self.b))
+            if slack[i] < tol and mu_ineq_star[i] > 1e-8
+        ]
+        
+        G_act = self.G[self.active_ineq] if len(self.active_ineq) > 0 else np.empty((0, self.n))
+        C_mat = np.vstack([self.A_eq, G_act])
+        m_total = C_mat.shape[0]
+        
+        K_mat = np.block([
+            [self.H, C_mat.T],
+            [C_mat, np.zeros((m_total, m_total))]
+        ])
+        self.K_inv_star = np.linalg.inv(K_mat)
+
+    def _add_constraint(self, K_inv, ineq_idx):
+        """Bordering (Complément de Schur) : ajoute l'inégalité ineq_idx à K_inv."""
+        v = np.zeros(K_inv.shape[0])
+        v[:self.n] = self.G[ineq_idx]
+        u = K_inv @ v
+        s = -np.dot(v, u)
+        if abs(s) < 1e-12:
+            raise RuntimeError("Colinéarité détectée (LICQ violée)")
+        K_top_left = K_inv + np.outer(u, u) / s
+        col_new = -u / s
+        return np.block([
+            [K_top_left, col_new[:, None]],
+            [col_new[None, :], np.array([[1.0 / s]])]
+        ])
+
+    def _drop_constraint(self, K_inv, pos_in_active):
+        """Downdating : retire la contrainte située à pos_in_active dans active_ineq."""
+        idx_kkt = self.n + self.m_eq + pos_in_active
+        alpha = K_inv[idx_kkt, idx_kkt]
+        d = np.delete(K_inv[:, idx_kkt], idx_kkt)
+        M = np.delete(np.delete(K_inv, idx_kkt, axis=0), idx_kkt, axis=1)
+        return M - np.outer(d, d) / alpha
+
+    def trace_what_if(self, target_ineq_idx, b_target):
+        """
+        Déplace la borne de l'inégalité `target_ineq_idx` jusqu'à `b_target` (à la hausse ou à la baisse).
+        Gère automatiquement toutes les entrées/sorties de base, y compris pour `target_ineq_idx`.
+        """
+        w = self.w_star.copy()
+        active_ineq = list(self.active_ineq)
+        mu_act = np.array([self.mu_ineq_star[i] for i in active_ineq], dtype=float)
+        K_inv = self.K_inv_star.copy()
+        b_vec = self.b.copy()
+        
+        b_curr = b_vec[target_ineq_idx]
+        direction = 1.0 if b_target >= b_curr else -1.0
+        breakpoints = []
+
+        # CAS 1 : La contrainte manipulée est initialement INACTIVE
+        if target_ineq_idx not in active_ineq:
+            val_portfolio = np.dot(self.G[target_ineq_idx], w)
+            if direction > 0 or b_target >= val_portfolio:
+                # On relâche une contrainte inactive ou on ne la resserre pas assez pour toucher le portefeuille
+                b_vec[target_ineq_idx] = b_target
+                return w, breakpoints, self.verify_kkt(w, active_ineq, mu_act, b_vec)
+            else:
+                # On resserre une contrainte inactive jusqu'à ce qu'elle percute le portefeuille !
+                b_curr = val_portfolio
+                b_vec[target_ineq_idx] = b_curr
+                K_inv = self._add_constraint(K_inv, target_ineq_idx)
+                active_ineq.append(target_ineq_idx)
+                mu_act = np.append(mu_act, 0.0)
+                breakpoints.append((b_curr, f"Allumage initial : {self.names[target_ineq_idx]} devient active"))
+
+        # CAS 2 : Boucle paramétrique tant que la contrainte manipulée est ACTIVE
+        while direction * (b_target - b_curr) > 1e-11:
+            pos_target = active_ineq.index(target_ineq_idx)
+            col_kkt = K_inv[:, self.n + self.m_eq + pos_target]
+            
+            # Vecteurs vitesses dans le sens du déplacement (direction = +1 ou -1)
+            v_w = direction * col_kkt[:self.n]
+            v_mu = direction * col_kkt[self.n + self.m_eq:]
+            
+            step_max = abs(b_target - b_curr)
+            event = ('target_reached', -1, '')
+            active_set_lookup = set(active_ineq)
+
+            # A. Test de collision sur TOUTES les inégalités inactives (G_j * w -> b_j)
+            slacks = b_vec - self.G @ w
+            approaches = self.G @ v_w
+            for j in range(len(b_vec)):
+                if j not in active_set_lookup and approaches[j] > 1e-9:
+                    dist = slacks[j] / approaches[j]
+                    if dist < step_max:
+                        step_max = dist
+                        event = ('add', j, f"Activation : {self.names[j]}")
+
+            # B. Test d'extinction sur TOUTES les inégalités actives (Y COMPRIS la contrainte manipulée !)
+            for pos, act_idx in enumerate(active_ineq):
+                if v_mu[pos] < -1e-9:
+                    dist = -mu_act[pos] / v_mu[pos]
+                    if dist < step_max:
+                        step_max = dist
+                        event = ('drop', pos, f"Désactivation (Optimum atteint) : {self.names[act_idx]}")
+
+            # Avancement sur le segment linéaire
+            w = w + step_max * v_w
+            mu_act = mu_act + step_max * v_mu
+            b_curr = b_curr + direction * step_max
+            b_vec[target_ineq_idx] = b_curr
+
+            if event[0] == 'target_reached':
+                break
+
+            breakpoints.append((b_curr, event[2]))
+            etype, e_idx, _ = event
+
+            if etype == 'add':
+                K_inv = self._add_constraint(K_inv, e_idx)
+                active_ineq.append(e_idx)
+                mu_act = np.append(mu_act, 0.0)
+            elif etype == 'drop':
+                dropped_constraint_id = active_ineq[e_idx]
+                K_inv = self._drop_constraint(K_inv, e_idx)
+                active_ineq.pop(e_idx)
+                mu_act = np.delete(mu_act, e_idx)
+                
+                # Si c'est la contrainte manipulée elle-même qui vient de s'éteindre,
+                # le portefeuille a atteint son optimum sans contrainte : relâcher plus ne change plus rien !
+                if dropped_constraint_id == target_ineq_idx:
+                    b_vec[target_ineq_idx] = b_target
+                    break
+
+        kkt_err = self.verify_kkt(w, active_ineq, mu_act, b_vec)
+        return w, breakpoints, kkt_err
+
+    def verify_kkt(self, w, active_ineq, mu_act, b_vec):
+        """Vérifie rigoureusement les conditions KKT primales et duales au point final."""
+        max_primal_viol = np.max(np.maximum(0.0, self.G @ w - b_vec))
+        min_dual_val = np.min(mu_act) if len(mu_act) > 0 else 0.0
+        max_dual_viol = max(0.0, -min_dual_val)
+        return max(max_primal_viol, max_dual_viol)
+
+
+# ==============================================================================
+# TEST DES 3 SCÉNARIOS CRITIQUES POINTÉS PAR TON RELECTEUR (500 ACTIFS)
+# ==============================================================================
+if __name__ == "__main__":
+    n = 500
+    np.random.seed(42)
+    B = np.random.randn(n, 10) * 0.12
+    idio_var = np.random.uniform(0.02, 0.06, size=n)
+    idio_var[:80] *= 0.55
+    Sigma = B @ B.T + np.diag(idio_var)
+    
+    u_max = 0.015
+    g_tech = np.zeros(n); g_tech[:80] = 1.0
+    
+    # Construction unifiée G * w <= b :
+    # Ligne 0 : Secteur Tech <= 0.08
+    # Lignes 1..500 : w_i <= 0.015 (Borne Max)
+    # Lignes 501..1000 : -w_i <= 0.0 (Borne Zéro)
+    G = np.vstack([g_tech, np.eye(n), -np.eye(n)])
+    b = np.concatenate([[0.08], np.full(n, u_max), np.zeros(n)])
+    names = ["Plafond Secteur Tech"] + [f"Borne Max Actif #{i}" for i in range(n)] + [f"Borne Zéro Actif #{i}" for i in range(n)]
+    
+    A_eq = np.ones((1, n))
+    b_eq = np.array([1.0])
+    
+    # Résolution initiale à Tech = 8% via qpOASES
+    A_ca = np.vstack([A_eq, g_tech])
+    solver = ca.conic('s', 'qpoases', {'h': ca.DM(Sigma).sparsity(), 'a': ca.DM(A_ca).sparsity()}, {'printLevel': 'none'})
+    res = solver(h=Sigma, g=np.zeros(n), a=A_ca, lba=[1.0, -np.inf], uba=[1.0, 0.08], lbx=np.zeros(n), ubx=np.full(n, u_max))
+    
+    w0 = np.array(res['x']).flatten()
+    lam_a0 = np.array(res['lam_a']).flatten()
+    lam_x0 = np.array(res['lam_x']).flatten()
+    
+    mu_eq0 = np.array([lam_a0[0]])
+    mu_ineq0 = np.concatenate([[max(0.0, lam_a0[1])], np.maximum(0.0, lam_x0), np.maximum(0.0, -lam_x0)])
+    
+    engine = UniversalParametricWhatIf(Sigma, np.zeros(n), A_eq, b_eq, G, b, names)
+    engine.initialize_from_anchor(w0, mu_eq0, mu_ineq0)
+
+    # TEST 1 : Relâchement massif (8% -> 35%) jusqu'à ce que la contrainte Tech S'ÉTEIGNE d'elle-même
+    t0 = time.perf_counter()
+    w_up, bp_up, err_up = engine.trace_what_if(target_ineq_idx=0, b_target=0.35)
+    t_up = (time.perf_counter() - t0) * 1000
+    print(f"=== TEST 1 : Relâchement (8% -> 35%) avec auto-extinction de la contrainte Tech ({t_up:.2f} ms) ===")
+    for val, reason in bp_up:
+        print(f"  -> {val*100:.4f}% : {reason}")
+    print(f"Poids Tech final atteint : {np.dot(g_tech, w_up)*100:.4f}% (Plafond demandé : 35%) | Erreur KKT : {err_up:.2e}\n")
+
+    # TEST 2 : Sens inverse ! Resserrement du curseur vers la gauche (8% -> 4%)
+    t0 = time.perf_counter()
+    w_down, bp_down, err_down = engine.trace_what_if(target_ineq_idx=0, b_target=0.04)
+    t_down = (time.perf_counter() - t0) * 1000
+    print(f"=== TEST 2 : Resserrement vers la gauche (8% -> 4%) ({t_down:.2f} ms) ===")
+    for val, reason in bp_down:
+        print(f"  -> {val*100:.4f}% : {reason}")
+    print(f"Poids Tech final atteint : {np.dot(g_tech, w_down)*100:.4f}% | Erreur KKT : {err_down:.2e}")
