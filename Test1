@@ -1,225 +1,489 @@
-import time
-import numpy as np
-import casadi as ca
-
-class UniversalParametricWhatIf:
-    """
-    Moteur d'homotopie quadratique exact (Active-Set Continuation).
-    Gère n'importe quelle contrainte linéaire G*w <= b dans les deux sens (relâchement / resserrement),
-    y compris l'allumage et l'extinction de la contrainte manipulée elle-même.
-    """
-    def __init__(self, Sigma, mu_vec, A_eq, b_eq, G, b, constraint_names):
-        self.H = Sigma
-        self.c = -mu_vec  # min 0.5 * w^T H w + c^T w
-        self.A_eq = A_eq  # Contraintes d'égalité (ex: Budget)
-        self.b_eq = b_eq
-        self.G = G        # Toutes les inégalités linéaires G w <= b (secteurs, bornes max, -bornes min)
-        self.b = b.copy()
-        self.names = constraint_names
-        self.n = Sigma.shape[0]
-        self.m_eq = A_eq.shape[0]
-
-    def initialize_from_anchor(self, w_star, mu_eq_star, mu_ineq_star, tol=1e-7):
-        """Construit la base active initiale et inverse la matrice KKT une seule fois."""
-        self.w_star = w_star.copy()
-        self.mu_eq_star = mu_eq_star.copy()
-        self.mu_ineq_star = mu_ineq_star.copy()
-        
-        # Une inégalité i est active si elle touche sa borne ET son multiplicateur est > 0
-        slack = self.b - self.G @ w_star
-        self.active_ineq = [
-            i for i in range(len(self.b))
-            if slack[i] < tol and mu_ineq_star[i] > 1e-8
-        ]
-        
-        G_act = self.G[self.active_ineq] if len(self.active_ineq) > 0 else np.empty((0, self.n))
-        C_mat = np.vstack([self.A_eq, G_act])
-        m_total = C_mat.shape[0]
-        
-        K_mat = np.block([
-            [self.H, C_mat.T],
-            [C_mat, np.zeros((m_total, m_total))]
-        ])
-        self.K_inv_star = np.linalg.inv(K_mat)
-
-    def _add_constraint(self, K_inv, ineq_idx):
-        """Bordering (Complément de Schur) : ajoute l'inégalité ineq_idx à K_inv."""
-        v = np.zeros(K_inv.shape[0])
-        v[:self.n] = self.G[ineq_idx]
-        u = K_inv @ v
-        s = -np.dot(v, u)
-        if abs(s) < 1e-12:
-            raise RuntimeError("Colinéarité détectée (LICQ violée)")
-        K_top_left = K_inv + np.outer(u, u) / s
-        col_new = -u / s
-        return np.block([
-            [K_top_left, col_new[:, None]],
-            [col_new[None, :], np.array([[1.0 / s]])]
-        ])
-
-    def _drop_constraint(self, K_inv, pos_in_active):
-        """Downdating : retire la contrainte située à pos_in_active dans active_ineq."""
-        idx_kkt = self.n + self.m_eq + pos_in_active
-        alpha = K_inv[idx_kkt, idx_kkt]
-        d = np.delete(K_inv[:, idx_kkt], idx_kkt)
-        M = np.delete(np.delete(K_inv, idx_kkt, axis=0), idx_kkt, axis=1)
-        return M - np.outer(d, d) / alpha
-
-    def trace_what_if(self, target_ineq_idx, b_target):
-        """
-        Déplace la borne de l'inégalité `target_ineq_idx` jusqu'à `b_target` (à la hausse ou à la baisse).
-        Gère automatiquement toutes les entrées/sorties de base, y compris pour `target_ineq_idx`.
-        """
-        w = self.w_star.copy()
-        active_ineq = list(self.active_ineq)
-        mu_act = np.array([self.mu_ineq_star[i] for i in active_ineq], dtype=float)
-        K_inv = self.K_inv_star.copy()
-        b_vec = self.b.copy()
-        
-        b_curr = b_vec[target_ineq_idx]
-        direction = 1.0 if b_target >= b_curr else -1.0
-        breakpoints = []
-
-        # CAS 1 : La contrainte manipulée est initialement INACTIVE
-        if target_ineq_idx not in active_ineq:
-            val_portfolio = np.dot(self.G[target_ineq_idx], w)
-            if direction > 0 or b_target >= val_portfolio:
-                # On relâche une contrainte inactive ou on ne la resserre pas assez pour toucher le portefeuille
-                b_vec[target_ineq_idx] = b_target
-                return w, breakpoints, self.verify_kkt(w, active_ineq, mu_act, b_vec)
-            else:
-                # On resserre une contrainte inactive jusqu'à ce qu'elle percute le portefeuille !
-                b_curr = val_portfolio
-                b_vec[target_ineq_idx] = b_curr
-                K_inv = self._add_constraint(K_inv, target_ineq_idx)
-                active_ineq.append(target_ineq_idx)
-                mu_act = np.append(mu_act, 0.0)
-                breakpoints.append((b_curr, f"Allumage initial : {self.names[target_ineq_idx]} devient active"))
-
-        # CAS 2 : Boucle paramétrique tant que la contrainte manipulée est ACTIVE
-        while direction * (b_target - b_curr) > 1e-11:
-            pos_target = active_ineq.index(target_ineq_idx)
-            col_kkt = K_inv[:, self.n + self.m_eq + pos_target]
-            
-            # Vecteurs vitesses dans le sens du déplacement (direction = +1 ou -1)
-            v_w = direction * col_kkt[:self.n]
-            v_mu = direction * col_kkt[self.n + self.m_eq:]
-            
-            step_max = abs(b_target - b_curr)
-            event = ('target_reached', -1, '')
-            active_set_lookup = set(active_ineq)
-
-            # A. Test de collision sur TOUTES les inégalités inactives (G_j * w -> b_j)
-            slacks = b_vec - self.G @ w
-            approaches = self.G @ v_w
-            for j in range(len(b_vec)):
-                if j not in active_set_lookup and approaches[j] > 1e-9:
-                    dist = slacks[j] / approaches[j]
-                    if dist < step_max:
-                        step_max = dist
-                        event = ('add', j, f"Activation : {self.names[j]}")
-
-            # B. Test d'extinction sur TOUTES les inégalités actives (Y COMPRIS la contrainte manipulée !)
-            for pos, act_idx in enumerate(active_ineq):
-                if v_mu[pos] < -1e-9:
-                    dist = -mu_act[pos] / v_mu[pos]
-                    if dist < step_max:
-                        step_max = dist
-                        event = ('drop', pos, f"Désactivation (Optimum atteint) : {self.names[act_idx]}")
-
-            # Avancement sur le segment linéaire
-            w = w + step_max * v_w
-            mu_act = mu_act + step_max * v_mu
-            b_curr = b_curr + direction * step_max
-            b_vec[target_ineq_idx] = b_curr
-
-            if event[0] == 'target_reached':
-                break
-
-            breakpoints.append((b_curr, event[2]))
-            etype, e_idx, _ = event
-
-            if etype == 'add':
-                K_inv = self._add_constraint(K_inv, e_idx)
-                active_ineq.append(e_idx)
-                mu_act = np.append(mu_act, 0.0)
-            elif etype == 'drop':
-                dropped_constraint_id = active_ineq[e_idx]
-                K_inv = self._drop_constraint(K_inv, e_idx)
-                active_ineq.pop(e_idx)
-                mu_act = np.delete(mu_act, e_idx)
-                
-                # Si c'est la contrainte manipulée elle-même qui vient de s'éteindre,
-                # le portefeuille a atteint son optimum sans contrainte : relâcher plus ne change plus rien !
-                if dropped_constraint_id == target_ineq_idx:
-                    b_vec[target_ineq_idx] = b_target
-                    break
-
-        kkt_err = self.verify_kkt(w, active_ineq, mu_act, b_vec)
-        return w, breakpoints, kkt_err
-
-    def verify_kkt(self, w, active_ineq, mu_act, b_vec):
-        """Vérifie rigoureusement les conditions KKT primales et duales au point final."""
-        max_primal_viol = np.max(np.maximum(0.0, self.G @ w - b_vec))
-        min_dual_val = np.min(mu_act) if len(mu_act) > 0 else 0.0
-        max_dual_viol = max(0.0, -min_dual_val)
-        return max(max_primal_viol, max_dual_viol)
-
-
-# ==============================================================================
-# TEST DES 3 SCÉNARIOS CRITIQUES POINTÉS PAR TON RELECTEUR (500 ACTIFS)
-# ==============================================================================
-if __name__ == "__main__":
-    n = 500
-    np.random.seed(42)
-    B = np.random.randn(n, 10) * 0.12
-    idio_var = np.random.uniform(0.02, 0.06, size=n)
-    idio_var[:80] *= 0.55
-    Sigma = B @ B.T + np.diag(idio_var)
+<!DOCTYPE html>
+<html lang="fr" class="h-full bg-slate-950 text-slate-100">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Analyseur en Coordonnées Parallèles Pro</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#f0f9ff',
+              100: '#e0f2fe',
+              400: '#38bdf8',
+              500: '#0ea5e9',
+              600: '#0284c7',
+              700: '#0369a1',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    /* Style personnalisé pour les axes D3, lignes et curseurs */
+    .axis line, .axis path {
+      stroke: #475569;
+      stroke-width: 1.5px;
+    }
+    .axis text {
+      fill: #94a3b8;
+      font-size: 11px;
+      font-weight: 500;
+      user-select: none;
+    }
+    .brush .selection {
+      fill: #38bdf8;
+      fill-opacity: 0.25;
+      stroke: #38bdf8;
+      stroke-width: 1.5px;
+      rx: 3px;
+      cursor: pointer;
+    }
+    .brush .handle {
+      fill: #0284c7;
+      stroke: #f8fafc;
+      stroke-width: 1.5px;
+      rx: 2px;
+    }
     
-    u_max = 0.015
-    g_tech = np.zeros(n); g_tech[:80] = 1.0
-    
-    # Construction unifiée G * w <= b :
-    # Ligne 0 : Secteur Tech <= 0.08
-    # Lignes 1..500 : w_i <= 0.015 (Borne Max)
-    # Lignes 501..1000 : -w_i <= 0.0 (Borne Zéro)
-    G = np.vstack([g_tech, np.eye(n), -np.eye(n)])
-    b = np.concatenate([[0.08], np.full(n, u_max), np.zeros(n)])
-    names = ["Plafond Secteur Tech"] + [f"Borne Max Actif #{i}" for i in range(n)] + [f"Borne Zéro Actif #{i}" for i in range(n)]
-    
-    A_eq = np.ones((1, n))
-    b_eq = np.array([1.0])
-    
-    # Résolution initiale à Tech = 8% via qpOASES
-    A_ca = np.vstack([A_eq, g_tech])
-    solver = ca.conic('s', 'qpoases', {'h': ca.DM(Sigma).sparsity(), 'a': ca.DM(A_ca).sparsity()}, {'printLevel': 'none'})
-    res = solver(h=Sigma, g=np.zeros(n), a=A_ca, lba=[1.0, -np.inf], uba=[1.0, 0.08], lbx=np.zeros(n), ubx=np.full(n, u_max))
-    
-    w0 = np.array(res['x']).flatten()
-    lam_a0 = np.array(res['lam_a']).flatten()
-    lam_x0 = np.array(res['lam_x']).flatten()
-    
-    mu_eq0 = np.array([lam_a0[0]])
-    mu_ineq0 = np.concatenate([[max(0.0, lam_a0[1])], np.maximum(0.0, lam_x0), np.maximum(0.0, -lam_x0)])
-    
-    engine = UniversalParametricWhatIf(Sigma, np.zeros(n), A_eq, b_eq, G, b, names)
-    engine.initialize_from_anchor(w0, mu_eq0, mu_ineq0)
+    /* Styles d'état pour les courbes */
+    .line-active {
+      stroke: #38bdf8 !important;
+      stroke-opacity: 0.85 !important;
+      stroke-width: 1.8px !important;
+    }
+    .line-inactive {
+      stroke: #334155 !important;
+      stroke-opacity: 0.12 !important;
+      stroke-width: 1px !important;
+    }
+    .line-highlight {
+      stroke: #f43f5e !important;
+      stroke-opacity: 1 !important;
+      stroke-width: 3.5px !important;
+    }
 
-    # TEST 1 : Relâchement massif (8% -> 35%) jusqu'à ce que la contrainte Tech S'ÉTEIGNE d'elle-même
-    t0 = time.perf_counter()
-    w_up, bp_up, err_up = engine.trace_what_if(target_ineq_idx=0, b_target=0.35)
-    t_up = (time.perf_counter() - t0) * 1000
-    print(f"=== TEST 1 : Relâchement (8% -> 35%) avec auto-extinction de la contrainte Tech ({t_up:.2f} ms) ===")
-    for val, reason in bp_up:
-        print(f"  -> {val*100:.4f}% : {reason}")
-    print(f"Poids Tech final atteint : {np.dot(g_tech, w_up)*100:.4f}% (Plafond demandé : 35%) | Erreur KKT : {err_up:.2e}\n")
+    /* Scrollbar */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #0f172a;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 3px;
+    }
+  </style>
+</head>
+<body class="h-full flex flex-col font-sans overflow-hidden bg-slate-950 text-slate-100">
 
-    # TEST 2 : Sens inverse ! Resserrement du curseur vers la gauche (8% -> 4%)
-    t0 = time.perf_counter()
-    w_down, bp_down, err_down = engine.trace_what_if(target_ineq_idx=0, b_target=0.04)
-    t_down = (time.perf_counter() - t0) * 1000
-    print(f"=== TEST 2 : Resserrement vers la gauche (8% -> 4%) ({t_down:.2f} ms) ===")
-    for val, reason in bp_down:
-        print(f"  -> {val*100:.4f}% : {reason}")
-    print(f"Poids Tech final atteint : {np.dot(g_tech, w_down)*100:.4f}% | Erreur KKT : {err_down:.2e}")
+  <!-- En-tête -->
+  <header class="bg-slate-900 border-b border-slate-800 px-5 py-2.5 flex items-center justify-between shrink-0 shadow-md">
+    <div class="flex items-center space-x-3">
+      <div class="p-1.5 bg-brand-600/20 text-brand-400 rounded-lg border border-brand-500/30">
+        <i class="fa-solid fa-chart-multigraph text-lg"></i>
+      </div>
+      <div>
+        <h1 class="text-sm font-bold tracking-wide text-white flex items-center gap-2">
+          Graphique d'Axes Parallèles
+          <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-brand-500/10 text-brand-400 border border-brand-500/20">Blazor Hybrid Ready</span>
+        </h1>
+        <p class="text-[11px] text-slate-400">Glisser pour filtrer &bull; <strong class="text-brand-400 font-semibold">Double-cliquer sur un curseur pour le supprimer</strong></p>
+      </div>
+    </div>
+
+    <!-- Actions & Stats -->
+    <div class="flex items-center space-x-3">
+      <div class="bg-slate-950 border border-slate-800 rounded-md px-3 py-1 flex items-center gap-3 text-xs">
+        <span class="text-slate-400">Courbes sélectionnées : <strong id="statActiveCount" class="text-brand-400">0</strong> / <span id="statTotalCount">0</span></span>
+        <div class="w-24 bg-slate-800 rounded-full h-1.5 overflow-hidden">
+          <div id="statProgressBar" class="bg-brand-400 h-1.5 rounded-full transition-all duration-300" style="width: 100%"></div>
+        </div>
+      </div>
+
+      <button id="btnResetFilters" class="px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-md border border-slate-700 transition flex items-center gap-1.5 shadow-sm">
+        <i class="fa-solid fa-rotate-left text-slate-400"></i> Réinitialiser Curseurs
+      </button>
+
+      <button id="btnShowCode" class="px-3 py-1.5 text-xs font-medium bg-brand-600 hover:bg-brand-500 text-white rounded-md transition shadow-md shadow-brand-600/20 flex items-center gap-1.5">
+        <i class="fa-brands fa-windows"></i> Code Blazor Hybrid (WPF)
+      </button>
+    </div>
+  </header>
+
+  <!-- Zone de Graphique -->
+  <main class="flex-1 relative w-full h-full bg-slate-950" id="plotContainer">
+    <div id="svgWrapper" class="absolute inset-0 w-full h-full"></div>
+  </main>
+
+  <!-- Modal pour intégration C# / Blazor Hybrid -->
+  <div id="codeModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center hidden opacity-0 transition-opacity duration-200">
+    <div class="bg-slate-900 border border-slate-800 rounded-xl w-11/12 max-w-4xl max-h-[85vh] flex flex-col shadow-2xl overflow-hidden">
+      
+      <div class="px-6 py-4 border-b border-slate-800 flex items-center justify-between bg-slate-950">
+        <div class="flex items-center space-x-3">
+          <div class="p-2 bg-purple-500/20 text-purple-400 rounded-lg">
+            <i class="fa-solid fa-code text-xl"></i>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-white">Intégration Blazor Hybrid (WPF + BlazorWebView)</h3>
+            <p class="text-xs text-slate-400">Comment appeler ce composant d3.js depuis ton composant Blazor Razor</p>
+          </div>
+        </div>
+        <button id="btnCloseModal" class="text-slate-400 hover:text-white p-2 rounded-lg hover:bg-slate-800">
+          <i class="fa-solid fa-xmark text-lg"></i>
+        </button>
+      </div>
+
+      <div class="p-6 overflow-y-auto space-y-6 text-sm text-slate-300">
+        <div>
+          <h4 class="font-bold text-white text-base mb-2 flex items-center gap-2">
+            <i class="fa-solid fa-cube text-brand-400"></i> Composant Blazor : <code class="text-brand-300">ParallelCoordinatesChart.razor</code>
+          </h4>
+          <p class="text-xs text-slate-400 mb-3">
+            Dans ton projet Blazor Hybrid, tu peux utiliser cet interop JS simple avec <code class="text-amber-300">IJSRuntime</code> pour injecter tes données C# vers le composant graph D3 :
+          </p>
+          <div class="bg-slate-950 p-4 rounded-lg border border-slate-800 font-mono text-xs overflow-x-auto text-sky-300">
+            <pre>@inject IJSRuntime JS
+@implements IAsyncDisposable
+
+&lt;div id="svgWrapper" style="width: 100%; height: 100%; min-height: 500px;"&gt;&lt;/div&gt;
+
+@code {
+    [Parameter] public IEnumerable&lt;object&gt; Data { get; set; }
+    [Parameter] public EventCallback&lt;List&lt;string&gt;&gt; OnFilterChanged { get; set; }
+
+    private DotNetObjectReference&lt;ParallelCoordinatesChart&gt;? dotNetHelper;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            dotNetHelper = DotNetObjectReference.Create(this);
+            await JS.InvokeVoidAsync("ParallelChart.init", dotNetHelper, Data);
+        }
+    }
+
+    [JSInvokable]
+    public void OnSelectionUpdated(List&lt;string&gt; selectedIds)
+    {
+        OnFilterChanged.InvokeAsync(selectedIds);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        dotNetHelper?.Dispose();
+    }
+}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Jeu de données de démonstration
+    const currentData = Array.from({ length: 220 }, (_, i) => {
+      const hp = Math.round(50 + Math.random() * 250);
+      const weight = Math.round(1500 + hp * 12 + Math.random() * 800);
+      const mpg = Math.round(Math.max(8, 45 - (hp * 0.12) - (weight * 0.003) + Math.random() * 6));
+      const accel = Math.round((20 - hp * 0.05 + Math.random() * 3) * 10) / 10;
+      const year = 1970 + Math.floor(Math.random() * 12);
+      const cyl = hp > 180 ? 8 : (hp > 110 ? 6 : 4);
+      return { id: `Item_${i+1}`, Consommation_MPG: mpg, Cylindres: cyl, Puissance_HP: hp, Poids_kg: weight, Accélération: accel, Année: year };
+    });
+
+    const firstRow = currentData[0];
+    const dimensions = Object.keys(firstRow).filter(k => k !== 'id' && typeof firstRow[k] === 'number');
+    
+    // Dictionnaire de filtres actifs : { dimensionName: [minVal, maxVal] }
+    let activeFilters = {};
+
+    let margin = { top: 40, right: 60, bottom: 30, left: 60 };
+    let width = 0;
+    let height = 0;
+    let svg, gPlot;
+    let yScales = {};
+    let xScale;
+    let brushes = {};
+
+    window.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('statTotalCount').textContent = currentData.length;
+      setupEventListeners();
+      initChartLayout();
+      updateChartDimensions();
+      renderPlot();
+
+      window.addEventListener('resize', () => {
+        if (svg) {
+          updateChartDimensions();
+          renderPlot();
+        }
+      });
+    });
+
+    function setupEventListeners() {
+      document.getElementById('btnResetFilters').addEventListener('click', () => {
+        resetAllFilters();
+      });
+
+      // Modal
+      const modal = document.getElementById('codeModal');
+      document.getElementById('btnShowCode').addEventListener('click', () => {
+        modal.classList.remove('hidden');
+        setTimeout(() => modal.classList.remove('opacity-0'), 10);
+      });
+      document.getElementById('btnCloseModal').addEventListener('click', closeModal);
+      modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal();
+      });
+
+      function closeModal() {
+        modal.classList.add('opacity-0');
+        setTimeout(() => modal.classList.add('hidden'), 200);
+      }
+    }
+
+    function initChartLayout() {
+      const container = document.getElementById('svgWrapper');
+      container.innerHTML = '';
+
+      svg = d3.select('#svgWrapper')
+        .append('svg')
+        .attr('width', '100%')
+        .attr('height', '100%');
+
+      gPlot = svg.append('g');
+    }
+
+    function updateChartDimensions() {
+      const container = document.getElementById('svgWrapper');
+      const rect = container.getBoundingClientRect();
+      width = Math.max(300, rect.width - margin.left - margin.right);
+      height = Math.max(200, rect.height - margin.top - margin.bottom);
+
+      gPlot.attr('transform', `translate(${margin.left},${margin.top})`);
+    }
+
+    function renderPlot() {
+      // 1. Échelles Y
+      yScales = {};
+      dimensions.forEach(dim => {
+        const domain = d3.extent(currentData, d => d[dim]);
+        const padding = (domain[1] - domain[0]) * 0.05 || 1;
+        yScales[dim] = d3.scaleLinear()
+          .domain([domain[0] - padding, domain[1] + padding])
+          .range([height, 0]);
+      });
+
+      // 2. Échelle X
+      xScale = d3.scalePoint()
+        .domain(dimensions)
+        .range([0, width])
+        .padding(0.15);
+
+      // Générateur de lignes
+      function path(d) {
+        return d3.line()(dimensions.map(p => [xScale(p), yScales[p](d[p])]));
+      }
+
+      gPlot.selectAll('*').remove();
+
+      // --- Layer 1 : Courbes (Couleur unique uniforme) ---
+      const linesGroup = gPlot.append('g').attr('class', 'lines');
+
+      linesGroup.selectAll('path')
+        .data(currentData, d => d.id)
+        .enter()
+        .append('path')
+        .attr('d', path)
+        .attr('fill', 'none')
+        .attr('class', 'line-active transition-all duration-150')
+        .on('mouseenter', function(event, d) {
+          // Survol de la courbe s'il est actif
+          if (d3.select(this).classed('line-active')) {
+            d3.select(this).classed('line-highlight', true).raise();
+          }
+        })
+        .on('mouseleave', function() {
+          d3.select(this).classed('line-highlight', false);
+        });
+
+      // --- Layer 2 : Axes verticaux ---
+      const axesGroup = gPlot.selectAll('.dimension-axis')
+        .data(dimensions)
+        .enter()
+        .append('g')
+        .attr('class', 'dimension-axis')
+        .attr('transform', d => `translate(${xScale(d)},0)`);
+
+      // Tracer les règles d'axes
+      axesGroup.append('g')
+        .attr('class', 'axis')
+        .each(function(d) {
+          d3.select(this).call(d3.axisLeft(yScales[d]).ticks(6).tickFormat(d3.format(".2s")));
+        });
+
+      // Titres des axes
+      axesGroup.append('text')
+        .attr('y', -15)
+        .attr('text-anchor', 'middle')
+        .attr('class', 'fill-slate-200 font-semibold text-xs tracking-wide cursor-default')
+        .text(d => d.replace('_', ' '));
+
+      // --- Layer 3 : D3 Brushes (Curseurs) ---
+      brushes = {};
+      dimensions.forEach(dim => {
+        const brush = d3.brushY()
+          .extent([[-12, 0], [12, height]])
+          .on('brush end', (event) => brushHandler(event, dim));
+
+        brushes[dim] = brush;
+
+        const brushG = gPlot.append('g')
+          .attr('class', `brush brush-${dim}`)
+          .attr('transform', `translate(${xScale(dim)},0)`)
+          .call(brush);
+
+        // Supprimer le curseur au double-clic
+        brushG.selectAll('.selection, .overlay')
+          .on('dblclick', function(event) {
+            event.stopPropagation();
+            removeSingleBrush(dim);
+          });
+
+        // Restaurer filtres si redimensionnement
+        if (activeFilters[dim]) {
+          const y0 = yScales[dim](activeFilters[dim][1]); // Max (en haut)
+          const y1 = yScales[dim](activeFilters[dim][0]); // Min (en bas)
+          brushG.call(brush.move, [y0, y1]);
+        }
+      });
+
+      updateFilteredLines();
+    }
+
+    // Gestion de la sélection du curseur
+    function brushHandler(event, dimension) {
+      if (!event.selection) {
+        delete activeFilters[dimension];
+      } else {
+        const [y0, y1] = event.selection;
+        // Remarque : yScales est inversé (0 est en haut)
+        const valMax = yScales[dimension].invert(y0);
+        const valMin = yScales[dimension].invert(y1);
+        activeFilters[dimension] = [valMin, valMax];
+      }
+      updateFilteredLines();
+    }
+
+    // Supprimer un curseur unique
+    function removeSingleBrush(dimension) {
+      delete activeFilters[dimension];
+      if (brushes[dimension]) {
+        gPlot.select(`.brush-${dimension}`).call(brushes[dimension].move, null);
+      }
+      updateFilteredLines();
+    }
+
+    // Réinitialiser tous les filtres
+    function resetAllFilters() {
+      activeFilters = {};
+      dimensions.forEach(dim => {
+        if (brushes[dim]) {
+          gPlot.select(`.brush-${dim}`).call(brushes[dim].move, null);
+        }
+      });
+      updateFilteredLines();
+    }
+
+    // Filtrage strict : la courbe DOIT valider TOUS les curseurs
+    function updateFilteredLines() {
+      let activeCount = 0;
+      const activeIds = [];
+      const filterKeys = Object.keys(activeFilters);
+
+      gPlot.selectAll('.lines path')
+        .each(function(d) {
+          // Vérification stricte : la donnée doit être dans la plage pour CHAQUE axe filtré
+          let isMatch = true;
+
+          for (let i = 0; i < filterKeys.length; i++) {
+            const dim = filterKeys[i];
+            const [min, max] = activeFilters[dim];
+            const val = d[dim];
+
+            // Tolerence de précision pour éviter les bugs d'arrondi aux bornes exactes
+            if (val < min - 0.00001 || val > max + 0.00001) {
+              isMatch = false;
+              break; // Invalide dès qu'un axe est hors borne
+            }
+          }
+
+          if (isMatch) {
+            d3.select(this)
+              .classed('line-inactive', false)
+              .classed('line-active', true);
+            activeCount++;
+            activeIds.push(d.id);
+          } else {
+            d3.select(this)
+              .classed('line-active', false)
+              .classed('line-inactive', true);
+          }
+        });
+
+      // Mettre à jour la barre de statistiques
+      const ratio = Math.round((activeCount / currentData.length) * 100);
+      document.getElementById('statActiveCount').textContent = activeCount;
+      document.getElementById('statProgressBar').style.width = `${ratio}%`;
+
+      // Envoi de la sélection à Blazor si connecté
+      if (window.dotNetReference) {
+        window.dotNetReference.invokeMethodAsync('OnSelectionUpdated', activeIds);
+      }
+    }
+  </script>
+</body>
+</html>
+
+@inject IJSRuntime JS
+@implements IAsyncDisposable
+
+<div id="svgWrapper" style="width: 100%; height: 100%; min-height: 500px;"></div>
+
+@code {
+    [Parameter] public IEnumerable<object> Data { get; set; }
+    [Parameter] public EventCallback<List<string>> OnFilterChanged { get; set; }
+
+    private DotNetObjectReference<ParallelCoordinatesChart>? dotNetHelper;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            dotNetHelper = DotNetObjectReference.Create(this);
+            await JS.InvokeVoidAsync("ParallelChart.init", dotNetHelper, Data);
+        }
+    }
+
+    [JSInvokable]
+    public void OnSelectionUpdated(List<string> selectedIds)
+    {
+        OnFilterChanged.InvokeAsync(selectedIds);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        dotNetHelper?.Dispose();
+    }
+}
